@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local env / secrets (never commit tokens)
+.env
+*.local
+
+# OS cruft
+.DS_Store
