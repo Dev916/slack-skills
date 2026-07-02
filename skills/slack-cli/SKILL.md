@@ -32,30 +32,38 @@ reuses the tokens slackcli already stored. Not authenticated / `invalid_auth`?
 
 - **`--json`** on `read` includes message timestamps — you need those `ts` values
   for thread replies, reactions, edits, pins. Progress text goes to **stderr**, so
-  stdout is clean JSON: `slackcli conversations read <ch> --json 2>/dev/null | jq …`.
+  stdout is clean JSON. Each message's `ts` is at `.messages[].ts`:
+  `slackcli conversations read <ch> --json 2>/dev/null | jq -r '.messages[] | "\(.ts)\t\(.text)"'`.
+- **Thread replies:** `--thread-ts` must be the thread's **root** `thread_ts`, not a
+  reply's own `ts`. If your target message is already inside a thread, use its
+  `thread_ts` field (from the `--json` output), not its `ts`.
 - **Channel ID prefixes:** `C…` channel, `D…` DM, `G…`/mpim group. Get them from
   `conversations list` (or `conversations.open` for a DM — see below).
 
 ## Everything else — Web API escape hatch
 
 ```bash
-python3 ~/.claude/skills/slack-cli/slack_api.py <method> [--workspace W] [key=value …] [--json '<body>']
+python3 ~/.claude/skills/slack-cli/slack_api.py <method> --workspace=<id> [key=value …] [--json '<body>']
 ```
 Reads tokens from slackcli's store, re-encodes the `d` cookie, POSTs to
 `https://slack.com/api/<method>`, prints JSON, exits non-zero on `ok:false`.
+`--workspace` accepts both `--workspace=<id>` and `--workspace <id>`.
+**⚠️ Always pass `--workspace=<id>` unless you truly mean the default** — omitting
+it silently uses `default_workspace` (your call can succeed against the wrong team).
 **Any** [Slack Web API method](https://api.slack.com/methods) works:
 
 | Op | Call |
 |----|------|
-| Search messages | `slack_api.py search.messages query="in:#general deploy" count=20` |
-| User by email | `slack_api.py users.lookupByEmail email=foo@bar.com` |
+| Search messages | `slack_api.py search.messages query="in:#general deploy" count=20 --workspace=<id>` |
+| User by email | `slack_api.py users.lookupByEmail email=foo@bar.com --workspace=<id>` |
 | User info / list | `slack_api.py users.info user=U012ABC` · `slack_api.py users.list limit=200` |
-| Open a DM (get `D…` id) | `slack_api.py conversations.open users=U012ABC` |
-| React | `slack_api.py reactions.add channel=C012 name=tada timestamp=<ts>` |
-| Edit a message | `slack_api.py chat.update channel=C012 ts=<ts> text="new"` |
-| Delete a message | `slack_api.py chat.delete channel=C012 ts=<ts>` |
-| Pin | `slack_api.py pins.add channel=C012 timestamp=<ts>` |
-| Rich (Block Kit) post | `slack_api.py chat.postMessage --json '{"channel":"C012","blocks":[…]}'` |
+| Open a DM (get `D…` id) | `slack_api.py conversations.open users=U012ABC --workspace=<id>` |
+| Send plain text (any channel incl. a `D…` DM) | `slack_api.py chat.postMessage channel=C012 text="hi" --workspace=<id>` |
+| React (name = bare emoji, no colons) | `slack_api.py reactions.add channel=C012 name=tada timestamp=<ts> --workspace=<id>` |
+| Edit a message | `slack_api.py chat.update channel=C012 ts=<ts> text="new" --workspace=<id>` |
+| Delete a message | `slack_api.py chat.delete channel=C012 ts=<ts> --workspace=<id>` |
+| Pin | `slack_api.py pins.add channel=C012 timestamp=<ts> --workspace=<id>` |
+| Rich (Block Kit) post | `slack_api.py chat.postMessage --json '{"channel":"C012","blocks":[…]}' --workspace=<id>` |
 
 Params are form-encoded; use `--json` for bodies containing arrays/objects.
 
@@ -71,7 +79,7 @@ Params are form-encoded; use `--json` for bodies containing arrays/objects.
 | Symptom | Fix |
 |---------|-----|
 | `invalid_auth` | Tokens expired → [[slack-login]] |
-| `channel_not_found` on a DM via `slackcli` | Use the **user** id (`U…`) with `messages send`, or `conversations.open users=U…` to get the `D…` id |
+| DM a user | Preferred: `messages send --recipient-id <U…>`. If that errors `channel_not_found`, open the DM then post via the API: `slack_api.py conversations.open users=<U…>` → take `.channel.id` (a `D…`) → `slack_api.py chat.postMessage channel=<D…> text="…"`. (`messages send` rejects a raw `D…`; `chat.postMessage` accepts it.) |
 | Need a message's `ts` | `slackcli conversations read <ch> --json` |
 | Posts look "bot-ish" | Expected — browser tokens act as the logged-in user |
 | Hand-written curl `Cookie: d=` | xoxd must be **URL-ENCODED** there (store keeps it decoded) — or just use `slack_api.py`, which encodes it |
