@@ -1,6 +1,6 @@
 ---
 name: slack-login
-description: Use when slackcli reports invalid_auth, when adding or re-authenticating a Slack workspace for the CLI, or when tokens have expired and an agent needs Slack read/send access. Covers extracting browser session tokens (xoxc + xoxd) and registering them with slackcli.
+description: Use when slackcli reports invalid_auth, when adding or re-authenticating a Slack workspace for the CLI, or when tokens have expired and an agent needs Slack read/send access. Covers extracting browser session tokens (xoxc + xoxd) and registering them with slackcli — from the superpowers-chrome browser (main path) OR from a regular Chrome profile the workspace is already signed into (fallback).
 ---
 
 # Slack Login (CLI via browser tokens)
@@ -18,6 +18,13 @@ and claude-in-chrome's network log exposes no request headers, so claude-in-chro
 **cannot** get it. Only the Chrome DevTools Protocol can, and the
 `superpowers-chrome` browser (the `use_browser` MCP tool) exposes CDP on
 `localhost:9222`.
+
+**Which path?** If the workspace is (or can be) signed into the superpowers-chrome
+browser, use the **main path** below. If the workspace is only signed into one of
+the user's **regular Chrome profiles** (Profile 8, Profile 37, …) — the common case,
+and what the user usually means by "log into my <X> Slack, it's open in my browser" —
+jump to **[Fallback: regular Chrome profile](#fallback-workspace-signed-into-a-regular-chrome-profile)**.
+That path is fully automated by `extract_from_profile.py` and needs no user sign-in.
 
 ## Prerequisites
 
@@ -87,6 +94,65 @@ slackcli conversations list --workspace=<TEAM_ID>   # expect a channel list
 rm -f /tmp/xoxd.txt
 ```
 
+## Fallback: workspace signed into a regular Chrome profile
+
+Use this when the workspace is signed into an **ordinary Chrome profile**, not the
+superpowers-chrome browser. You **cannot** CDP into a running Chrome profile that
+wasn't launched with `--remote-debugging-port`, and you can't relaunch that profile
+with one while Chrome already has it open. Reading the profile's files by hand is a
+trap (see "Why the by-hand route fails" below).
+
+Instead, `extract_from_profile.py` copies the profile's essentials into a throwaway
+`--user-data-dir`, launches a **headless Chrome on that copy** with a debug port, and
+lets Chrome itself decode localStorage and decrypt the `d` cookie. Both values come
+out correct and provably matched (it runs `auth.test` before returning).
+
+**One command** — auto-detects the profile, extracts, validates, and registers:
+```bash
+python3 ~/.claude/skills/slack-login/extract_from_profile.py \
+  --team <TEAM_ID> --register --name "<Name>"
+```
+It prints `auth.test OK — team=… user=…` then the slackcli success line, and a final
+JSON `{"ok": true, "registered": true, …}`. Secrets never pass through the agent's
+context; the throwaway profile and any temp files are removed on exit.
+
+Then verify as usual:
+```bash
+slackcli conversations list --workspace=<TEAM_ID>
+```
+
+**Options:**
+- `--profile "Profile 37"` — force a profile dir (skip auto-detect).
+- `--profile-name Clever` — match a profile by its display name substring.
+- omit `--register` — extract only; writes `xoxc`/`xoxd` to `0600` temp files in
+  `$TMPDIR` and prints their paths (the `xoxd` file is already URL-decoded for
+  slackcli). Delete them yourself afterward.
+- `--port 9333` (default), `--chrome <path>`, `--wait 18` (secs to wait for the token).
+
+**Don't know the TEAM_ID?** Read the profile's display name from Chrome's
+`Local State` (`~/Library/Application Support/Google/Chrome/Local State` →
+`profile.info_cache`) to find the right profile, then open Slack there to read the
+team id — or just run the script with `--profile-name <X>` and no team and it will
+error with the team ids it found. Simplest: the user usually knows the workspace URL
+or you can get the TEAM_ID from `app.slack.com/client/<TEAM_ID>`.
+
+**No Keychain prompt.** Chrome is in the ACL for its own "Chrome Safe Storage"
+Keychain item, so the headless Chrome decrypts the `d` cookie silently. (Decrypting
+by hand with the `security` CLI *does* prompt, because that tool isn't in the ACL —
+another reason to let Chrome do it.)
+
+### Why the by-hand route fails (do NOT do this)
+- **`xoxc` is Snappy-compressed in leveldb.** The profile's `Local Storage/leveldb`
+  is Snappy-compressed, and a token can straddle a compression block boundary. Naive
+  `strings`/`grep` returns a **truncated** token (looks like `xoxc-AAA-BBB`, missing
+  the later groups + the 64-hex tail) → `invalid_auth`. Only a real leveldb/Snappy
+  decoder (or Chrome itself) reconstructs it.
+- **The `d` cookie is Keychain-encrypted AND URL-encoded.** Decrypting it yourself
+  (AES-128-CBC, key = PBKDF2 of the "Chrome Safe Storage" Keychain secret) yields the
+  **URL-encoded** cookie value; slackcli needs it **URL-decoded**. Passing the encoded
+  form → `invalid_auth`. Letting Chrome read it via CDP `Network.getAllCookies` gives
+  the raw encoded value, which the script then `unquote()`s for slackcli.
+
 ## Critical gotchas
 
 | Gotcha | Rule |
@@ -97,6 +163,8 @@ rm -f /tmp/xoxd.txt
 | TEAM_ID + domain | From `localConfig_v2.teams`, or the `app.slack.com/client/<TEAM_ID>` URL |
 | Re-auth of a live session | Browser still logged in → re-extract tokens, no user sign-in needed |
 | Managed domains (custom-domain Google Workspace) | May require org-admin consent; the user handles any sign-in/consent screen |
+| Workspace only in a regular Chrome profile | Don't sign in again in superpowers-chrome — use `extract_from_profile.py` (fallback section); it reuses the existing session, no user action |
+| Reading a profile's files by hand | `xoxc` is Snappy-compressed (truncates) and the `d` cookie is Keychain-encrypted + URL-encoded — let headless Chrome + CDP decode both instead |
 
 ## Set the default workspace (optional)
 ```bash
@@ -108,3 +176,8 @@ slackcli auth set-default <TEAM_ID>   # then --workspace can be omitted
 - Passing the URL-encoded `xoxd` to `slackcli` (login fails). Use `--decoded`.
 - Assuming a fresh browser has the session — a new superpowers-chrome profile is
   logged out; the user must sign in once first.
+- Trying to CDP into the user's regular Chrome — it has no debug port, and you
+  can't relaunch that profile with one while Chrome is running. Use the fallback
+  (`extract_from_profile.py`), which works on a throwaway copy of the profile.
+- Hand-parsing the profile's leveldb/cookies for tokens — truncated `xoxc` and
+  wrongly-encoded `xoxd` both yield `invalid_auth`. Let Chrome decode them.
